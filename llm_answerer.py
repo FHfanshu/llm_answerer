@@ -109,6 +109,12 @@ class CacheDB:
         except Exception as e:
             print(f"[缓存写入失败] {e}")
 
+    async def delete(self, key: str):
+        if not self.conn:
+            return
+        await self.conn.execute('DELETE FROM answer_cache WHERE question_hash = ?', (key,))
+        await self.conn.commit()
+
 
 db = CacheDB(DB_PATH)
 
@@ -150,7 +156,7 @@ def save_question_bank():
 
 def add_to_bank(key: str, answer: str):
     """添加到题库"""
-    if key not in question_bank:
+    if is_cacheable_answer(answer) and key not in question_bank:
         question_bank[key] = answer
         # 每 10 条保存一次
         if len(question_bank) % 10 == 0:
@@ -252,11 +258,21 @@ def validate_answer(answer: str, qtype: str) -> bool:
     return True
 
 
+BAD_ANSWERS = {"", "无", "none", "null", "调用失败", "api调用失败"}
+
+
+def is_cacheable_answer(answer: Optional[str]) -> bool:
+    if answer is None:
+        return False
+    return answer.strip().lower() not in BAD_ANSWERS
+
+
 # ========== LLM 调用（带重试验证） ==========
 async def call_llm(title: str, options: str = None, qtype: str = None) -> str:
     """调用 LLM 获取答案，格式不对自动重试"""
     user_msg = build_user_message(title, options, qtype)
     extra_params = get_llm_params()
+    answer = "调用失败"
 
     for attempt in range(3):
         try:
@@ -270,7 +286,9 @@ async def call_llm(title: str, options: str = None, qtype: str = None) -> str:
                 max_tokens=50,
                 **extra_params
             )
-            answer = resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content
+            if content:
+                answer = content.strip()
             if validate_answer(answer, qtype):
                 return answer
             print(f"[格式验证失败] 尝试 {attempt + 1}/3: {answer}")
@@ -279,7 +297,7 @@ async def call_llm(title: str, options: str = None, qtype: str = None) -> str:
         if attempt < 2:
             await asyncio.sleep(0.5)
 
-    return answer if 'answer' in dir() else "调用失败"
+    return answer
 
 
 # ========== FastAPI ==========
@@ -379,15 +397,23 @@ async def search(request: Request):
 
     # 1. 先查题库文件（内存，最快）
     if not skip_cache and key in question_bank:
-        stats["bank_hit"] += 1
         answer = question_bank[key]
-        dashboard.record(title, answer, 0.001, "bank")
-        refresh_dashboard()
-        return JSONResponse({"code": 1, "question": title, "answer": answer})
+        if not is_cacheable_answer(answer):
+            question_bank.pop(key, None)
+            save_question_bank()
+        else:
+            stats["bank_hit"] += 1
+            dashboard.record(title, answer, 0.001, "bank")
+            refresh_dashboard()
+            return JSONResponse({"code": 1, "question": title, "answer": answer})
 
     # 2. 再查数据库缓存
     if not skip_cache:
         cached = await db.get(key)
+        if cached:
+            if not is_cacheable_answer(cached):
+                await db.delete(key)
+                cached = None
         if cached:
             if random.random() >= CACHE_RETRY_PROBABILITY:
                 stats["cache_hit"] += 1
@@ -400,6 +426,11 @@ async def search(request: Request):
     start = time.time()
     answer = await call_llm(title, options, qtype)
     elapsed = time.time() - start
+
+    if not validate_answer(answer, qtype) or not is_cacheable_answer(answer):
+        dashboard.record(title, "失败", elapsed, "error", 0)
+        refresh_dashboard()
+        return JSONResponse({"code": 0, "msg": "LLM未返回有效答案"})
 
     # 估算 token（粗略：中文 1 字 ≈ 2 token）
     est_tokens = len(title) * 2 + 50
@@ -437,12 +468,18 @@ async def batch_search(request: Request):
 
         # 先查题库
         if key in question_bank:
-            stats["bank_hit"] += 1
-            dashboard.record(title, question_bank[key], 0.001, "bank")
-            return {"code": 1, "question": title, "answer": question_bank[key]}
+            answer = question_bank[key]
+            if is_cacheable_answer(answer):
+                stats["bank_hit"] += 1
+                dashboard.record(title, answer, 0.001, "bank")
+                return {"code": 1, "question": title, "answer": answer}
+            question_bank.pop(key, None)
 
         # 再查数据库
         cached = await db.get(key)
+        if cached and not is_cacheable_answer(cached):
+            await db.delete(key)
+            cached = None
         if cached and random.random() >= CACHE_RETRY_PROBABILITY:
             stats["cache_hit"] += 1
             add_to_bank(key, cached)
@@ -453,6 +490,9 @@ async def batch_search(request: Request):
         start = time.time()
         answer = await call_llm(title, options, qtype)
         elapsed = time.time() - start
+        if not validate_answer(answer, qtype) or not is_cacheable_answer(answer):
+            dashboard.record(title, "失败", elapsed, "error", 0)
+            return {"code": 0, "question": title, "msg": "LLM未返回有效答案"}
         est_tokens = len(title) * 2 + 50
 
         await db.set(key, title, options or "", qtype or "", answer)

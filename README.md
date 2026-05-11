@@ -100,7 +100,7 @@ Windows PowerShell:
       "options": "${options}",
       "type": "${type}"
     },
-    "handler": "return (res) => res.code === 1 ? [undefined, res.answer] : [res.msg, undefined]"
+    "handler": "return (res) => res.code === 1 ? [res.question, res.answer] : [res.msg, undefined]"
   }
 ]
 ```
