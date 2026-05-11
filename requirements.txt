@@ -1,0 +1,7 @@
+openai
+fastapi
+uvicorn
+aiosqlite
+python-dotenv
+aiohttp
+rich
