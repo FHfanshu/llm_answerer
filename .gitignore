@@ -4,3 +4,4 @@ __pycache__/
 *.py[cod]
 answer_cache.db*
 question_bank.json
+*.zip

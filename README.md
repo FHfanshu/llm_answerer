@@ -2,7 +2,7 @@
 
 一个 OpenAI-compatible 的本地答题服务，提供 OCS `AnswererWrapper` 兼容 HTTP 接口。
 
-当前版本主打低延迟和低成本：先查本地题库，再查 SQLite 缓存，未命中时才调用 LLM。Prompt 使用固定 system 前缀，把动态题目放在最后，便于服务端 prefix/KV cache 命中。
+当前版本主打低延迟和低成本：先查本地题库，再查 SQLite 缓存，未命中时才调用 LLM。Prompt 使用固定 system 前缀，把动态题目放在最后，便于服务端 prefix/KV cache 命中。LLM 请求使用 JSON Output：模型返回 `{"answer":"..."}`，服务端再解析为 OCS 需要的答案格式。
 
 ## 功能
 
@@ -11,7 +11,8 @@
 - 本地 `question_bank.json` 题库缓存
 - SQLite 二级缓存
 - FastAPI 异步接口，可处理并发请求
-- Rich 终端 dashboard，显示命中率、请求来源、估算 token 和平均耗时
+- Rich 终端 dashboard，显示命中率、请求来源、真实 token、DeepSeek prompt cache 和平均耗时
+- 读取 DeepSeek `usage.prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`，显示服务端 prompt cache 命中率
 - 支持 OpenAI-compatible API，例如 DeepSeek、OpenRouter、火山等
 - 可选 Tavily/Exa 搜索模块保留在 `search.py`，主服务默认不走置信度和联网搜索
 
@@ -78,7 +79,9 @@ Windows PowerShell:
 - 题库命中数
 - SQLite 命中数
 - 总命中率
-- 估算 token 消耗
+- 实际 token 消耗（来自 API usage）
+- DeepSeek prompt cache hit/miss tokens
+- DeepSeek prompt cache 命中率
 - 平均耗时
 - 最近请求日志
 
@@ -231,6 +234,10 @@ GET /stats
   "bank_hits": 35,
   "db_hits": 10,
   "hit_rate": "90.0%",
+  "deepseek_prompt_cache_hit_tokens": 768,
+  "deepseek_prompt_cache_miss_tokens": 190,
+  "deepseek_prompt_cache_rate": "80.2%",
+  "total_tokens": 973,
   "bank_size": 120,
   "context_window": 5
 }
@@ -275,6 +282,11 @@ user: 当前题型、题干、选项
 ```
 
 固定内容尽量放在 `system`，动态题目只放在最后的 `user` 消息中，便于 OpenAI-compatible 服务端进行 prefix/KV cache 复用。
+
+DeepSeek 的服务端缓存命中不等于本地题库命中。`/stats` 中：
+
+- `hit_rate` 是本地题库 + SQLite 命中率
+- `deepseek_prompt_cache_rate` 是 DeepSeek 返回的服务端 prompt cache 命中率
 
 ## 文件说明
 

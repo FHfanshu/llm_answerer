@@ -12,7 +12,7 @@ import re
 import html
 import time
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Any, Optional
 
 import aiosqlite
 from openai import AsyncOpenAI
@@ -214,27 +214,28 @@ def cache_key(title: str, options: Optional[str] = None) -> str:
 SYSTEM_PROMPT = """你是一个用于自学练习的题目解析助手。你需要根据题干和选项给出答案。
 
 必须遵守以下规则：
-1. 只输出答案，不要输出任何解释。
-2. 单选题：只输出一个选项字母（如 A）。
-3. 多选题：输出所有正确选项字母，用 # 分隔（如 A#C#D）。
-4. 判断题：只输出"正确"或"错误"。
-5. 填空题：直接输出答案，多个空用 # 分隔。
-6. 不确定时也要给出最可能的答案。
+1. 必须只输出 JSON，不要输出任何 JSON 以外的内容。
+2. JSON 格式必须是：{"answer":"..."}。
+3. 单选题：answer 是一个选项字母（如 "A"）。
+4. 多选题：answer 是所有正确选项字母，用 # 分隔（如 "A#C#D"）。
+5. 判断题：answer 是 "正确" 或 "错误"。
+6. 填空题：answer 是填空内容，多个空用 # 分隔。
+7. 不确定时也要给出最可能的答案。
 
 示例：
 题型：single
 题干：1+1=？
 选项：A. 1  B. 2  C. 3  D. 4
-答案：B
+JSON 输出：{"answer":"B"}
 
 题型：judgement
 题干：地球是圆的
-答案：正确
+JSON 输出：{"answer":"正确"}
 
 题型：multiple
 题干：以下哪些是编程语言？
 选项：A. Python  B. HTML  C. Java  D. CSS
-答案：A#C
+JSON 输出：{"answer":"A#C"}
 """
 
 
@@ -389,12 +390,54 @@ def is_valid_cached_answer(answer: Optional[str], qtype: Optional[str]) -> bool:
     return validate_answer(answer or "", qtype)
 
 
+def parse_json_answer(content: str) -> str:
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return content
+    answer = data.get("answer")
+    if isinstance(answer, list):
+        return "#".join(str(item).strip() for item in answer)
+    if isinstance(answer, bool):
+        return "正确" if answer else "错误"
+    if answer is None:
+        return content
+    return str(answer)
+
+
+def usage_value(usage: Any, name: str) -> int:
+    if usage is None:
+        return 0
+    if isinstance(usage, dict):
+        value = usage.get(name, 0)
+    else:
+        value = getattr(usage, name, 0)
+    return int(value or 0)
+
+
+def response_usage(response: Any) -> dict[str, int]:
+    usage = getattr(response, "usage", None)
+    prompt_tokens = usage_value(usage, "prompt_tokens")
+    completion_tokens = usage_value(usage, "completion_tokens")
+    total_tokens = usage_value(usage, "total_tokens")
+    prompt_cache_hit_tokens = usage_value(usage, "prompt_cache_hit_tokens")
+    prompt_cache_miss_tokens = usage_value(usage, "prompt_cache_miss_tokens")
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens or prompt_tokens + completion_tokens,
+        "prompt_cache_hit_tokens": prompt_cache_hit_tokens,
+        "prompt_cache_miss_tokens": prompt_cache_miss_tokens,
+    }
+
+
 # ========== LLM 调用（带重试验证） ==========
-async def call_llm(title: str, options: str = None, qtype: str = None) -> str:
+async def call_llm(title: str, options: str = None, qtype: str = None) -> tuple[str, dict[str, int]]:
     """调用 LLM 获取答案，格式不对自动重试"""
     user_msg = build_user_message(title, options, qtype)
     extra_params = get_llm_params()
     answer = "调用失败"
+    usage = {"total_tokens": 0, "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 0}
 
     for attempt in range(3):
         try:
@@ -406,20 +449,22 @@ async def call_llm(title: str, options: str = None, qtype: str = None) -> str:
                 ],
                 temperature=0.1,
                 max_tokens=100,
+                response_format={"type": "json_object"},
                 **extra_params
             )
+            usage = response_usage(resp)
             content = resp.choices[0].message.content
             if content:
-                answer = extract_answer(content, qtype, options)
+                answer = extract_answer(parse_json_answer(content), qtype, options)
             if validate_answer(answer, qtype):
-                return answer
+                return answer, usage
             print(f"[格式验证失败] 尝试 {attempt + 1}/3: {answer}")
         except Exception as e:
             print(f"[API调用失败] 尝试 {attempt + 1}/3: {e}")
         if attempt < 2:
             await asyncio.sleep(0.5)
 
-    return answer
+    return answer, usage
 
 
 # ========== FastAPI ==========
@@ -475,6 +520,10 @@ async def get_stats():
         "bank_hits": stats["bank_hit"],
         "db_hits": stats["cache_hit"],
         "hit_rate": f"{rate:.1f}%",
+        "deepseek_prompt_cache_hit_tokens": dashboard.prompt_cache_hit_tokens,
+        "deepseek_prompt_cache_miss_tokens": dashboard.prompt_cache_miss_tokens,
+        "deepseek_prompt_cache_rate": f"{dashboard.deepseek_cache_rate:.1f}%",
+        "total_tokens": dashboard.total_tokens,
         "bank_size": len(question_bank),
         "context_window": len(context_window)
     }
@@ -546,23 +595,36 @@ async def search(request: Request):
 
     # 调用 LLM
     start = time.time()
-    answer = await call_llm(title, options, qtype)
+    answer, usage = await call_llm(title, options, qtype)
     elapsed = time.time() - start
 
     if not is_valid_cached_answer(answer, qtype):
-        dashboard.record(title, "失败", elapsed, "error", 0)
+        dashboard.record(
+            title,
+            "失败",
+            elapsed,
+            "error",
+            usage.get("total_tokens", 0),
+            usage.get("prompt_cache_hit_tokens", 0),
+            usage.get("prompt_cache_miss_tokens", 0),
+        )
         refresh_dashboard()
         return JSONResponse({"code": 0, "msg": "LLM未返回有效答案"})
-
-    # 估算 token（粗略：中文 1 字 ≈ 2 token）
-    est_tokens = len(title) * 2 + 50
 
     # 写缓存 + 题库 + 上下文
     await db.set(key, title, options, qtype, answer)
     add_to_bank(key, answer)
     add_context(title, answer)
 
-    dashboard.record(title, answer, elapsed, "llm", est_tokens)
+    dashboard.record(
+        title,
+        answer,
+        elapsed,
+        "llm",
+        usage.get("total_tokens", 0),
+        usage.get("prompt_cache_hit_tokens", 0),
+        usage.get("prompt_cache_miss_tokens", 0),
+    )
     refresh_dashboard()
 
     return JSONResponse({"code": 1, "question": title, "answer": answer})
@@ -610,17 +672,32 @@ async def batch_search(request: Request):
 
         # 调用 LLM
         start = time.time()
-        answer = await call_llm(title, options, qtype)
+        answer, usage = await call_llm(title, options, qtype)
         elapsed = time.time() - start
         if not is_valid_cached_answer(answer, qtype):
-            dashboard.record(title, "失败", elapsed, "error", 0)
+            dashboard.record(
+                title,
+                "失败",
+                elapsed,
+                "error",
+                usage.get("total_tokens", 0),
+                usage.get("prompt_cache_hit_tokens", 0),
+                usage.get("prompt_cache_miss_tokens", 0),
+            )
             return {"code": 0, "question": title, "msg": "LLM未返回有效答案"}
-        est_tokens = len(title) * 2 + 50
 
         await db.set(key, title, options or "", qtype or "", answer)
         add_to_bank(key, answer)
         add_context(title, answer)
-        dashboard.record(title, answer, elapsed, "llm", est_tokens)
+        dashboard.record(
+            title,
+            answer,
+            elapsed,
+            "llm",
+            usage.get("total_tokens", 0),
+            usage.get("prompt_cache_hit_tokens", 0),
+            usage.get("prompt_cache_miss_tokens", 0),
+        )
         return {"code": 1, "question": title, "answer": answer}
 
     stats["total"] += len(questions)

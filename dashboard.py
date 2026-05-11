@@ -24,9 +24,20 @@ class Dashboard:
         self.db_hits = 0
         self.errors = 0
         self.total_tokens = 0
+        self.prompt_cache_hit_tokens = 0
+        self.prompt_cache_miss_tokens = 0
         self.total_elapsed = 0.0
 
-    def record(self, title: str, answer: str, elapsed: float, source: str, tokens: int = 0):
+    def record(
+        self,
+        title: str,
+        answer: str,
+        elapsed: float,
+        source: str,
+        tokens: int = 0,
+        prompt_cache_hit_tokens: int = 0,
+        prompt_cache_miss_tokens: int = 0,
+    ):
         """记录一次请求"""
         self.total += 1
         if source == "bank":
@@ -37,6 +48,8 @@ class Dashboard:
             self.errors += 1
 
         self.total_tokens += tokens
+        self.prompt_cache_hit_tokens += prompt_cache_hit_tokens
+        self.prompt_cache_miss_tokens += prompt_cache_miss_tokens
         self.total_elapsed += elapsed
 
         self.requests.append({
@@ -56,6 +69,11 @@ class Dashboard:
     @property
     def avg_elapsed(self) -> float:
         return self.total_elapsed / self.total if self.total > 0 else 0
+
+    @property
+    def deepseek_cache_rate(self) -> float:
+        total = self.prompt_cache_hit_tokens + self.prompt_cache_miss_tokens
+        return self.prompt_cache_hit_tokens / total * 100 if total > 0 else 0
 
     def build_header(self, model: str, port: int, bank_size: int) -> Panel:
         """构建头部信息"""
@@ -88,6 +106,9 @@ class Dashboard:
         table.add_row("总命中率", f"[bold cyan]{self.hit_rate:.1f}%[/bold cyan]")
         table.add_row("错误", f"[red]{self.errors}[/red]" if self.errors > 0 else "0")
         table.add_row("Token 消耗", f"~{self.total_tokens:,}")
+        table.add_row("DS缓存命中", f"{self.prompt_cache_hit_tokens:,}")
+        table.add_row("DS缓存未命中", f"{self.prompt_cache_miss_tokens:,}")
+        table.add_row("DS缓存率", f"[bold magenta]{self.deepseek_cache_rate:.1f}%[/bold magenta]")
         table.add_row("平均耗时", f"{self.avg_elapsed:.1f}s")
 
         return Panel(table, title="[bold]统计[/bold]", border_style="green", box=box.ROUNDED)
