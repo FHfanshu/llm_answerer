@@ -1,21 +1,31 @@
+"""
+LLM 答题服务 - 精简版
+直接调用 LLM 返回答案，支持并发，带缓存
+"""
 import os
 import sys
 import hashlib
 import json
-import argparse
+import asyncio
+import random
+import re
+import html
 import time
-from datetime import datetime
 from contextlib import asynccontextmanager
+from typing import Optional
+
+import aiosqlite
 from openai import AsyncOpenAI
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
-import aiosqlite
-import asyncio
-import random
-from confidence import answer_with_confidence, validate_answer
+import uvicorn
+from rich.console import Console
+from rich.live import Live
 
-# 设置UTF-8编码以正确显示中文
+from dashboard import dashboard
+
+# UTF-8 编码
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 if sys.platform == 'win32':
     os.system('chcp 65001 >nul 2>&1')
@@ -29,51 +39,44 @@ if sys.platform == 'win32':
 
 load_dotenv()
 
+# 配置
+API_KEY = os.getenv("OPENAI_API_KEY")
+MODEL = os.getenv("OPENAI_MODEL", "deepseek-chat")
+BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
+PORT = int(os.getenv("LISTEN_PORT", "5000"))
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 CACHE_RETRY_PROBABILITY = float(os.getenv("CACHE_RETRY_PROBABILITY", "0.1"))
+DB_PATH = os.getenv("DB_PATH", "answer_cache.db")
+QUESTION_BANK_PATH = os.getenv("QUESTION_BANK_PATH", "question_bank.json")
 
-class LLMAnswerer:
-    def __init__(self, api_key=None, model="gpt-3.5-turbo", db_path="answer_cache.db",
-                 base_url=None, custom_headers=None):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+# Reasoning Effort
+REASONING_EFFORT = os.getenv("REASONING_EFFORT", "").lower()
 
-        if not self.api_key:
-            raise ValueError(
-                "未设置OPENAI_API_KEY。请在.env文件中设置或通过参数传入。\n"
-                "请复制.env.example为.env并填入你的API密钥。"
-            )
+# 初始化 LLM 客户端
+client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
 
-        self.model = model
+
+def get_llm_params() -> dict:
+    """获取 LLM 调用额外参数"""
+    params = {}
+    if REASONING_EFFORT in ("low", "medium", "high"):
+        params["reasoning_effort"] = REASONING_EFFORT
+        params["extra_body"] = {"thinking": {"type": "enabled"}}
+    return params
+
+
+# ========== 数据库 ==========
+class CacheDB:
+    def __init__(self, db_path: str):
         self.db_path = db_path
-        self.base_url = base_url or os.getenv("OPENAI_BASE_URL")
-        self.custom_headers = custom_headers or {}
-        self.db_conn = None
+        self.conn: Optional[aiosqlite.Connection] = None
 
-        client_kwargs = {"api_key": self.api_key}
-        if self.base_url:
-            client_kwargs["base_url"] = self.base_url
-        if self.custom_headers:
-            client_kwargs["default_headers"] = self.custom_headers
-
-        self.client = AsyncOpenAI(**client_kwargs)
-
-    async def connect_db(self):
-        """建立数据库连接"""
-        self.db_conn = await aiosqlite.connect(self.db_path)
-        await self.db_conn.execute('PRAGMA journal_mode=WAL')
-        await self.db_conn.execute('PRAGMA cache_size=-64000')
-        await self.db_conn.execute('PRAGMA synchronous=NORMAL')
-        await self.db_conn.commit()
-
-    async def close_db(self):
-        """关闭数据库连接"""
-        if self.db_conn:
-            await self.db_conn.close()
-            self.db_conn = None
-
-    async def init_database(self):
-        """初始化SQLite数据库"""
-        await self.db_conn.execute('''
+    async def connect(self):
+        self.conn = await aiosqlite.connect(self.db_path)
+        await self.conn.execute('PRAGMA journal_mode=WAL')
+        await self.conn.execute('PRAGMA cache_size=-64000')
+        await self.conn.execute('PRAGMA synchronous=NORMAL')
+        await self.conn.execute('''
             CREATE TABLE IF NOT EXISTS answer_cache (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 question_hash TEXT UNIQUE NOT NULL,
@@ -84,279 +87,390 @@ class LLMAnswerer:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        await self.db_conn.execute('CREATE INDEX IF NOT EXISTS idx_question_hash ON answer_cache(question_hash)')
-        await self.db_conn.commit()
+        await self.conn.execute('CREATE INDEX IF NOT EXISTS idx_hash ON answer_cache(question_hash)')
+        await self.conn.commit()
 
-    def _get_cache_key(self, title, options):
-        """生成缓存键"""
-        content = f"{title}|{options or ''}"
-        return hashlib.md5(content.encode()).hexdigest()
+    async def close(self):
+        if self.conn:
+            await self.conn.close()
 
-    async def _get_cached_answer(self, cache_key):
-        """从数据库获取缓存答案"""
-        cursor = await self.db_conn.execute('SELECT answer FROM answer_cache WHERE question_hash = ?', (cache_key,))
-        result = await cursor.fetchone()
-        return result[0] if result else None
+    async def get(self, key: str) -> Optional[str]:
+        cursor = await self.conn.execute('SELECT answer FROM answer_cache WHERE question_hash = ?', (key,))
+        row = await cursor.fetchone()
+        return row[0] if row else None
 
-    async def _save_to_cache(self, cache_key, title, options, question_type, answer):
-        """保存答案到数据库"""
+    async def set(self, key: str, title: str, options: str, qtype: str, answer: str):
         try:
-            await self.db_conn.execute('''
-                INSERT OR REPLACE INTO answer_cache
-                (question_hash, title, options, question_type, answer)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (cache_key, title, options, question_type, answer))
-            await self.db_conn.commit()
+            await self.conn.execute(
+                'INSERT OR REPLACE INTO answer_cache (question_hash, title, options, question_type, answer) VALUES (?, ?, ?, ?, ?)',
+                (key, title, options, qtype, answer)
+            )
+            await self.conn.commit()
         except Exception as e:
-            print(f"保存缓存失败: {e}")
+            print(f"[缓存写入失败] {e}")
 
-    async def _call_llm(self, title, options=None, question_type=None):
-        """调用OpenAI API（带置信度判断版本）"""
-        answer = await answer_with_confidence(
-            client=self.client,
-            model=self.model,
-            title=title,
-            options=options,
-            question_type=question_type
-        )
-        return answer
 
-    async def answer_question(self, title, options=None, question_type=None, skip_cache=False):
-        """
-        将题目转换为LLM请求并获取答案
-        返回格式: [error_msg, answer, elapsed_time]
-        """
-        start_time = time.time()
-        cache_key = self._get_cache_key(title, options)
+db = CacheDB(DB_PATH)
 
-        if not skip_cache:
-            cached_answer = await self._get_cached_answer(cache_key)
-            if cached_answer:
-                elapsed = time.time() - start_time
-                if random.random() < CACHE_RETRY_PROBABILITY:
-                    print(f"[缓存命中-随机重试] 题目: {title[:50]}... -> 旧答案: {cached_answer} (耗时: {elapsed*1000:.0f}ms)")
-                else:
-                    print(f"[缓存命中] 题目: {title[:50]}... -> 答案: {cached_answer} (耗时: {elapsed*1000:.0f}ms)")
-                    return [None, cached_answer, elapsed]
+# 请求统计
+stats = {"total": 0, "cache_hit": 0, "bank_hit": 0}
 
-        # confidence.py 已经实现了重试和验证机制，这里只需要调用一次
+# 题库文件（JSON）
+question_bank: dict[str, str] = {}  # hash -> answer
+
+
+def load_question_bank():
+    """加载题库文件"""
+    global question_bank
+    if os.path.exists(QUESTION_BANK_PATH):
         try:
-            answer = await self._call_llm(title, options, question_type)
-            elapsed = time.time() - start_time
-
-            # confidence.py 内部已经做了验证，但这里再次验证以确保万无一失
-            if validate_answer(answer, question_type):
-                await self._save_to_cache(cache_key, title, options, question_type, answer)
-                print(f"[LLM回答] 题目: {title[:50]}... -> 答案: {answer} (耗时: {elapsed*1000:.0f}ms)")
-                return [None, answer, elapsed]
-            else:
-                # 理论上不应该到这里，因为 confidence.py 已经验证过
-                elapsed = time.time() - start_time
-                print(f"[警告] confidence.py 返回了无效答案: {answer} (耗时: {elapsed*1000:.0f}ms)")
-                return ["LLM返回的答案格式不规范", None, elapsed]
-
+            with open(QUESTION_BANK_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                # 兼容新旧格式
+                if isinstance(data, dict):
+                    question_bank = data
+                elif isinstance(data, list):
+                    # 旧格式：[{hash, answer, title, ...}, ...]
+                    for item in data:
+                        if "hash" in item and "answer" in item:
+                            question_bank[item["hash"]] = item["answer"]
+            print(f"[题库] 已加载 {len(question_bank)} 条记录")
         except Exception as e:
-            elapsed = time.time() - start_time
-            print(f"[请求失败] {str(e)} (耗时: {elapsed*1000:.0f}ms)")
-            return [f"LLM请求失败: {str(e)}", None, elapsed]
+            print(f"[题库] 加载失败: {e}")
 
-    def get_config_info(self):
-        """获取配置信息"""
-        return {
-            "model": self.model,
-            "base_url": self.base_url or "https://api.openai.com/v1",
-            "db_path": self.db_path,
-            "api_key_set": bool(self.api_key)
-        }
 
-GLOBAL_SKIP_CACHE = False
-answerer = None
+def save_question_bank():
+    """保存题库文件"""
+    try:
+        with open(QUESTION_BANK_PATH, 'w', encoding='utf-8') as f:
+            json.dump(question_bank, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[题库] 保存失败: {e}")
+
+
+def add_to_bank(key: str, answer: str):
+    """添加到题库"""
+    if key not in question_bank:
+        question_bank[key] = answer
+        # 每 10 条保存一次
+        if len(question_bank) % 10 == 0:
+            save_question_bank()
+
+# 上下文滑动窗口（最近的 Q&A 对）
+CONTEXT_WINDOW_SIZE = 5
+context_window: list[dict] = []  # [{"q": "题目", "a": "答案"}, ...]
+
+
+def add_context(title: str, answer: str):
+    """添加到上下文窗口"""
+    context_window.append({"q": title, "a": answer})
+    if len(context_window) > CONTEXT_WINDOW_SIZE:
+        context_window.pop(0)
+
+
+def get_context_text() -> str:
+    """获取上下文文本"""
+    if not context_window:
+        return ""
+    lines = ["最近答过的题目："]
+    for i, item in enumerate(context_window, 1):
+        lines.append(f"{i}. {item['q']} → {item['a']}")
+    return "\n".join(lines)
+
+
+def cache_key(title: str, options: Optional[str] = None) -> str:
+    """生成缓存键，规范化输入以提高命中率"""
+    def normalize(text: str) -> str:
+        if not text:
+            return ""
+        text = html.unescape(text)  # HTML 实体解码
+        text = re.sub(r"<[^>]+>", "", text)  # 去 HTML 标签
+        text = text.replace("\u00a0", " ")  # 不间断空格
+        text = re.sub(r"\s+", " ", text)  # 合并空格
+        text = text.strip().lower()
+        # 统一标点
+        text = text.replace('（', '(').replace('）', ')')
+        text = text.replace('，', ',').replace('。', '.')
+        text = text.replace('：', ':').replace('；', ';')
+        text = text.replace('"', '"').replace('"', '"')
+        text = text.replace(''', "'").replace(''', "'")
+        return text
+
+    norm_title = normalize(title)
+    norm_options = normalize(options) if options else ""
+    return hashlib.sha256(f"{norm_title}|{norm_options}".encode()).hexdigest()
+
+
+# ========== Prompt（长固定前缀 + 题目放最后） ==========
+SYSTEM_PROMPT = """你是一个用于自学练习的题目解析助手。你需要根据题干和选项给出答案。
+
+必须遵守以下规则：
+1. 只输出答案，不要输出任何解释。
+2. 单选题：只输出一个选项字母（如 A）。
+3. 多选题：输出所有正确选项字母，用 # 分隔（如 A#C#D）。
+4. 判断题：只输出"正确"或"错误"。
+5. 填空题：直接输出答案，多个空用 # 分隔。
+6. 不确定时也要给出最可能的答案。
+
+示例：
+题型：single
+题干：1+1=？
+选项：A. 1  B. 2  C. 3  D. 4
+答案：B
+
+题型：judgement
+题干：地球是圆的
+答案：正确
+
+题型：multiple
+题干：以下哪些是编程语言？
+选项：A. Python  B. HTML  C. Java  D. CSS
+答案：A#C
+"""
+
+
+def build_user_message(title: str, options: str = None, qtype: str = None) -> str:
+    """构建用户消息（动态部分，放最后）"""
+    msg = f"题型：{qtype or 'unknown'}\n题干：{title}"
+    if options:
+        msg += f"\n选项：{options}"
+    return msg
+
+
+# ========== 答案验证 ==========
+def validate_answer(answer: str, qtype: str) -> bool:
+    if not answer or not answer.strip():
+        return False
+    answer = answer.strip()
+    if qtype == "single":
+        return len(answer) == 1 and answer.isalpha()
+    elif qtype == "multiple":
+        parts = answer.split('#')
+        return all(len(p) == 1 and p.isalpha() for p in parts)
+    elif qtype == "judgement":
+        return answer in ["正确", "错误"]
+    return True
+
+
+# ========== LLM 调用（带重试验证） ==========
+async def call_llm(title: str, options: str = None, qtype: str = None) -> str:
+    """调用 LLM 获取答案，格式不对自动重试"""
+    user_msg = build_user_message(title, options, qtype)
+    extra_params = get_llm_params()
+
+    for attempt in range(3):
+        try:
+            resp = await client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},  # 固定前缀，所有题一样
+                    {"role": "user", "content": user_msg}  # 动态题目，放最后
+                ],
+                temperature=0.1,
+                max_tokens=50,
+                **extra_params
+            )
+            answer = resp.choices[0].message.content.strip()
+            if validate_answer(answer, qtype):
+                return answer
+            print(f"[格式验证失败] 尝试 {attempt + 1}/3: {answer}")
+        except Exception as e:
+            print(f"[API调用失败] 尝试 {attempt + 1}/3: {e}")
+        if attempt < 2:
+            await asyncio.sleep(0.5)
+
+    return answer if 'answer' in dir() else "调用失败"
+
+
+# ========== FastAPI ==========
+console = Console()
+live: Optional[Live] = None
+
+
+def refresh_dashboard():
+    """刷新 dashboard 显示"""
+    if live:
+        live.update(dashboard.render(MODEL, PORT, len(question_bank)))
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """应用生命周期管理"""
-    await answerer.connect_db()
-    await answerer.init_database()
+    global live
+    await db.connect()
+    load_question_bank()
+
+    # 启动 Rich Live 显示
+    live = Live(
+        dashboard.render(MODEL, PORT, len(question_bank)),
+        console=console,
+        refresh_per_second=1,
+        screen=True
+    )
+    live.start()
+
     yield
-    await answerer.close_db()
+
+    save_question_bank()
+    await db.close()
+    if live:
+        live.stop()
+
 
 app = FastAPI(lifespan=lifespan)
 
-def print_startup_info(answerer_obj, port):
-    """打印启动信息"""
-    config = answerer_obj.get_config_info()
-
-    # 获取额外的配置信息
-    exa_api_key = os.getenv("EXA_API_KEY")
-    confidence_threshold = float(os.getenv("CONFIDENCE_THRESHOLD", "0.7"))
-
-    print("\n" + "="*60)
-    print("LLM智能答题服务启动成功（异步版本）")
-    print("="*60)
-    print(f"启动时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"服务地址: http://localhost:{port}")
-    print(f"API端点: http://localhost:{port}/search")
-
-    # 功能状态摘要
-    print("-"*60)
-    print("启用功能:")
-    features = []
-    features.append(f"  ✓ 智能缓存 (随机重试概率: {CACHE_RETRY_PROBABILITY*100:.0f}%)")
-    if exa_api_key:
-        features.append(f"  ✓ 置信度评估 + 联网搜索 (阈值: {confidence_threshold:.1f})")
-    else:
-        features.append(f"  ✓ 置信度评估 (阈值: {confidence_threshold:.1f})")
-        features.append(f"  ✗ 联网搜索 (未配置 EXA_API_KEY)")
-    if ACCESS_TOKEN:
-        features.append(f"  ✓ 访问令牌认证")
-    else:
-        features.append(f"  ✗ 访问令牌认证 (未启用)")
-
-    for feature in features:
-        print(feature)
-
-    # LLM配置
-    print("-"*60)
-    print("LLM配置:")
-    print(f"  模型: {config['model']}")
-    print(f"  API地址: {config['base_url']}")
-    print(f"  API密钥: {'已设置' if config['api_key_set'] else '未设置'}")
-
-    # 存储配置
-    print("-"*60)
-    print("存储配置:")
-    print(f"  数据库: {config['db_path']}")
-    print(f"  缓存策略: MD5哈希 + 随机重试")
-
-    # Exa搜索配置
-    if exa_api_key:
-        print("-"*60)
-        print("联网搜索配置:")
-        print(f"  Exa API: 已配置")
-        print(f"  搜索触发: 置信度 < {confidence_threshold:.1f}")
-
-    # AnswererWrapper配置
-    print("-"*60)
-    print("AnswererWrapper配置:")
-    print("[")
-
-    headers_config = {"Content-Type": "application/json"}
-    if ACCESS_TOKEN:
-        headers_config["X-Access-Token"] = ACCESS_TOKEN
-
-    print(json.dumps({
-        "name": "LLM智能答题",
-        "url": f"http://localhost:{port}/search",
-        "method": "post",
-        "contentType": "json",
-        "type": "GM_xmlhttpRequest",
-        "headers": headers_config,
-        "data": {
-            "title": "${title}",
-            "options": "${options}",
-            "type": "${type}"
-        },
-        "handler": "return (res) => res.code === 1 ? [undefined, res.answer] : [res.msg, undefined]"
-    }, ensure_ascii=False, indent=2))
-    print("]")
-    print("="*60 + "\n")
 
 @app.get('/')
 @app.head('/')
 async def heartbeat():
-    """心跳检查接口"""
-    return "服务已启动"
+    return "ok"
+
+
+@app.get('/stats')
+async def get_stats():
+    """缓存统计"""
+    total_hits = stats["bank_hit"] + stats["cache_hit"]
+    rate = total_hits / stats["total"] * 100 if stats["total"] > 0 else 0
+    return {
+        "total_requests": stats["total"],
+        "bank_hits": stats["bank_hit"],
+        "db_hits": stats["cache_hit"],
+        "hit_rate": f"{rate:.1f}%",
+        "bank_size": len(question_bank),
+        "context_window": len(context_window)
+    }
+
 
 @app.get('/search')
 @app.post('/search')
 async def search(request: Request):
-    """模拟题库API接口，实际使用LLM生成答案"""
+    # 解析参数
     if request.method == 'GET':
         params = dict(request.query_params)
         title = params.get('title', '')
         options = params.get('options')
-        question_type = params.get('type')
-        skip_cache = GLOBAL_SKIP_CACHE or params.get('skip_cache', 'false').lower() == 'true'
+        qtype = params.get('type')
+        skip_cache = params.get('skip_cache', 'false').lower() == 'true'
         token = request.headers.get('X-Access-Token') or params.get('token')
-
-        if title and sys.platform == 'win32':
-            try:
-                title = title.encode('latin1').decode('utf-8')
-            except (UnicodeDecodeError, UnicodeEncodeError):
-                pass
-
-        if options and sys.platform == 'win32':
-            try:
-                options = options.encode('latin1').decode('utf-8')
-            except (UnicodeDecodeError, UnicodeEncodeError):
-                pass
+        # Windows 中文编码修复
+        if sys.platform == 'win32':
+            for k in ('title', 'options'):
+                if locals()[k]:
+                    try:
+                        locals()[k] = locals()[k].encode('latin1').decode('utf-8')
+                    except (UnicodeDecodeError, UnicodeEncodeError):
+                        pass
     else:
         data = await request.json()
         title = data.get('title', '')
         options = data.get('options')
-        question_type = data.get('type')
-        skip_cache = GLOBAL_SKIP_CACHE or data.get('skip_cache', False)
-        token = request.headers.get('X-Access-Token') or request.query_params.get('token') or data.get('token')
+        qtype = data.get('type')
+        skip_cache = data.get('skip_cache', False)
+        token = request.headers.get('X-Access-Token') or data.get('token')
 
+    # 鉴权
     if ACCESS_TOKEN and token != ACCESS_TOKEN:
         return JSONResponse({"code": 0, "msg": "无效的访问令牌"}, status_code=401)
-
-    print(f"\n[收到请求] {datetime.now().strftime('%H:%M:%S')} - 题型: {question_type or '未知'}")
-    print(f"  题目: {title[:100]}{'...' if len(title) > 100 else ''}")
-    if options:
-        print(f"  选项: {options[:100]}{'...' if len(options) > 100 else ''}")
-    if skip_cache:
-        print(f"  跳过缓存: 是")
 
     if not title:
         return JSONResponse({"code": 0, "msg": "题目不能为空"})
 
-    result = await answerer.answer_question(title, options, question_type, skip_cache)
-    error_msg, answer, elapsed_time = result if len(result) == 3 else (*result, 0)
+    key = cache_key(title, options)
+    stats["total"] += 1
 
-    if answer:
-        response_data = {
-            "code": 1,
-            "question": title,
-            "answer": answer
-#            ,"elapsed_time": round(elapsed_time, 3),
-#            "elapsed_ms": round(elapsed_time * 1000, 0)
-        }
-        print(f"[响应成功] 答案: {answer}, 总耗时: {elapsed_time*1000:.0f}ms")
-        return JSONResponse(response_data)
-    else:
-        response_data = {
-            "code": 0,
-            "msg": error_msg or "未知错误"
-#            ,"elapsed_time": round(elapsed_time, 3),
-#            "elapsed_ms": round(elapsed_time * 1000, 0)
-        }
-        print(f"[响应失败] 错误: {error_msg}, 总耗时: {elapsed_time*1000:.0f}ms")
-        return JSONResponse(response_data)
+    # 1. 先查题库文件（内存，最快）
+    if not skip_cache and key in question_bank:
+        stats["bank_hit"] += 1
+        answer = question_bank[key]
+        dashboard.record(title, answer, 0.001, "bank")
+        refresh_dashboard()
+        return JSONResponse({"code": 1, "question": title, "answer": answer})
+
+    # 2. 再查数据库缓存
+    if not skip_cache:
+        cached = await db.get(key)
+        if cached:
+            if random.random() >= CACHE_RETRY_PROBABILITY:
+                stats["cache_hit"] += 1
+                add_to_bank(key, cached)  # 同步到题库
+                dashboard.record(title, cached, 0.005, "db")
+                refresh_dashboard()
+                return JSONResponse({"code": 1, "question": title, "answer": cached})
+
+    # 调用 LLM
+    start = time.time()
+    answer = await call_llm(title, options, qtype)
+    elapsed = time.time() - start
+
+    # 估算 token（粗略：中文 1 字 ≈ 2 token）
+    est_tokens = len(title) * 2 + 50
+
+    # 写缓存 + 题库 + 上下文
+    await db.set(key, title, options, qtype, answer)
+    add_to_bank(key, answer)
+    add_context(title, answer)
+
+    dashboard.record(title, answer, elapsed, "llm", est_tokens)
+    refresh_dashboard()
+
+    return JSONResponse({"code": 1, "question": title, "answer": answer})
+
+
+@app.post('/batch')
+async def batch_search(request: Request):
+    """批量答题接口 - 并发处理多题"""
+    data = await request.json()
+    questions = data.get("questions", [])
+
+    if not questions:
+        return JSONResponse({"code": 0, "msg": "题目列表为空"})
+
+    # 鉴权
+    token = request.headers.get('X-Access-Token') or data.get('token')
+    if ACCESS_TOKEN and token != ACCESS_TOKEN:
+        return JSONResponse({"code": 0, "msg": "无效的访问令牌"}, status_code=401)
+
+    async def process_one(q: dict) -> dict:
+        title = q.get("title", "")
+        options = q.get("options")
+        qtype = q.get("type")
+        key = cache_key(title, options)
+
+        # 先查题库
+        if key in question_bank:
+            stats["bank_hit"] += 1
+            dashboard.record(title, question_bank[key], 0.001, "bank")
+            return {"code": 1, "question": title, "answer": question_bank[key]}
+
+        # 再查数据库
+        cached = await db.get(key)
+        if cached and random.random() >= CACHE_RETRY_PROBABILITY:
+            stats["cache_hit"] += 1
+            add_to_bank(key, cached)
+            dashboard.record(title, cached, 0.005, "db")
+            return {"code": 1, "question": title, "answer": cached}
+
+        # 调用 LLM
+        start = time.time()
+        answer = await call_llm(title, options, qtype)
+        elapsed = time.time() - start
+        est_tokens = len(title) * 2 + 50
+
+        await db.set(key, title, options or "", qtype or "", answer)
+        add_to_bank(key, answer)
+        add_context(title, answer)
+        dashboard.record(title, answer, elapsed, "llm", est_tokens)
+        return {"code": 1, "question": title, "answer": answer}
+
+    stats["total"] += len(questions)
+    print(f"\n[批量请求] {len(questions)} 题")
+
+    # 并发处理
+    results = await asyncio.gather(*[process_one(q) for q in questions])
+
+    refresh_dashboard()
+
+    return JSONResponse({"code": 1, "results": list(results)})
+
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='LLM智能答题服务')
-    parser.add_argument('-skipcache', '--skip-cache', action='store_true',
-                        help='跳过缓存，所有请求直接调用LLM API')
-    args = parser.parse_args()
-
-    GLOBAL_SKIP_CACHE = args.skip_cache
-
-    port = int(os.getenv("LISTEN_PORT", 5000))
-    model = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
-    base_url = os.getenv("OPENAI_BASE_URL")
-
-    custom_headers = {
-        "User-Agent": "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "X-Client-Name": "question-libraries"
-    }
-    answerer = LLMAnswerer(model=model, base_url=base_url, custom_headers=custom_headers)
-
-    print_startup_info(answerer, port)
-
-    if GLOBAL_SKIP_CACHE:
-        print("⚠️  缓存已全局禁用 - 所有请求将直接调用LLM API")
-        print("="*60 + "\n")
-
-    import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=port)
+    uvicorn.run(app, host='0.0.0.0', port=PORT, workers=1)
