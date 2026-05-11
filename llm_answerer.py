@@ -62,6 +62,9 @@ def get_llm_params() -> dict:
     if REASONING_EFFORT in ("low", "medium", "high"):
         params["reasoning_effort"] = REASONING_EFFORT
         params["extra_body"] = {"thinking": {"type": "enabled"}}
+    elif "deepseek" in BASE_URL.lower():
+        # DeepSeek reasoning models may return empty content unless thinking is explicit.
+        params["extra_body"] = {"thinking": {"type": "disabled"}}
     return params
 
 
@@ -256,7 +259,7 @@ def format_options(options: Optional[str]) -> str:
 
 def build_user_message(title: str, options: Optional[str] = None, qtype: Optional[str] = None) -> str:
     """构建用户消息（动态部分，放最后）"""
-    msg = f"题型：{qtype or 'unknown'}\n题干：{title}"
+    msg = f"题型：{normalize_question_type(qtype) or 'unknown'}\n题干：{title}"
     formatted_options = format_options(options)
     if formatted_options:
         msg += f"\n选项：\n{formatted_options}"
@@ -264,9 +267,57 @@ def build_user_message(title: str, options: Optional[str] = None, qtype: Optiona
 
 
 # ========== 答案验证 ==========
+def normalize_question_type(qtype: Optional[str]) -> Optional[str]:
+    if not qtype:
+        return None
+    value = qtype.strip().lower()
+    if value in ("single", "radio") or "单选" in value:
+        return "single"
+    if value in ("multiple", "checkbox") or "多选" in value:
+        return "multiple"
+    if value in ("judgement", "judge", "judgment", "boolean", "truefalse") or "判断" in value:
+        return "judgement"
+    if value in ("completion", "blank", "fill") or "填空" in value:
+        return "completion"
+    return value
+
+
+def option_labels(options: Optional[str]) -> list[str]:
+    formatted = format_options(options)
+    labels = []
+    for line in formatted.splitlines():
+        match = re.match(r"^([A-Z])\.\s*", line.upper())
+        if match:
+            labels.append(match.group(1))
+    return labels
+
+
+def option_text_map(options: Optional[str]) -> dict[str, str]:
+    mapping = {}
+    formatted = format_options(options)
+    for line in formatted.splitlines():
+        match = re.match(r"^([A-Z])\.\s*(.*)$", line, re.IGNORECASE)
+        if match:
+            mapping[match.group(1).upper()] = cache_normalize(match.group(2))
+    return mapping
+
+
+def cache_normalize(text: str) -> str:
+    text = html.unescape(text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("\u00a0", " ")
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip().lower()
+    text = text.replace('（', '(').replace('）', ')')
+    text = text.replace('，', ',').replace('。', '.')
+    text = text.replace('：', ':').replace('；', ';')
+    return text
+
+
 def validate_answer(answer: str, qtype: Optional[str]) -> bool:
     if not answer or not answer.strip():
         return False
+    qtype = normalize_question_type(qtype)
     answer = answer.strip().upper()
     if qtype == "single":
         return len(answer) == 1 and "A" <= answer <= "Z"
@@ -280,8 +331,46 @@ def validate_answer(answer: str, qtype: Optional[str]) -> bool:
 
 def normalize_answer(answer: str, qtype: Optional[str]) -> str:
     answer = answer.strip()
-    if qtype in ("single", "multiple"):
+    if normalize_question_type(qtype) in ("single", "multiple"):
         return answer.upper().replace(" ", "")
+    return answer
+
+
+def extract_answer(raw_answer: str, qtype: Optional[str], options: Optional[str]) -> str:
+    answer = raw_answer.strip()
+    normalized_type = normalize_question_type(qtype)
+
+    if normalized_type == "judgement":
+        lowered = answer.lower()
+        if any(token in lowered for token in ("正确", "对", "true", "yes")):
+            return "正确"
+        if any(token in lowered for token in ("错误", "错", "false", "no")):
+            return "错误"
+        return answer
+
+    labels = option_labels(options)
+    if normalized_type == "single":
+        candidates = re.findall(r"(?<![A-Z])([A-Z])(?![A-Z])", answer.upper())
+        for candidate in candidates:
+            if not labels or candidate in labels:
+                return candidate
+
+        normalized_answer = cache_normalize(answer)
+        for label, option_text in option_text_map(options).items():
+            if option_text and (option_text in normalized_answer or normalized_answer in option_text):
+                return label
+        return normalize_answer(answer, normalized_type)
+
+    if normalized_type == "multiple":
+        candidates = re.findall(r"(?<![A-Z])([A-Z])(?![A-Z])", answer.upper())
+        selected = []
+        for candidate in candidates:
+            if (not labels or candidate in labels) and candidate not in selected:
+                selected.append(candidate)
+        if selected:
+            return "#".join(selected)
+        return normalize_answer(answer, normalized_type)
+
     return answer
 
 
@@ -292,6 +381,12 @@ def is_cacheable_answer(answer: Optional[str]) -> bool:
     if answer is None:
         return False
     return answer.strip().lower() not in BAD_ANSWERS
+
+
+def is_valid_cached_answer(answer: Optional[str], qtype: Optional[str]) -> bool:
+    if not is_cacheable_answer(answer):
+        return False
+    return validate_answer(answer or "", qtype)
 
 
 # ========== LLM 调用（带重试验证） ==========
@@ -310,12 +405,12 @@ async def call_llm(title: str, options: str = None, qtype: str = None) -> str:
                     {"role": "user", "content": user_msg}  # 动态题目，放最后
                 ],
                 temperature=0.1,
-                max_tokens=50,
+                max_tokens=100,
                 **extra_params
             )
             content = resp.choices[0].message.content
             if content:
-                answer = normalize_answer(content, qtype)
+                answer = extract_answer(content, qtype, options)
             if validate_answer(answer, qtype):
                 return answer
             print(f"[格式验证失败] 尝试 {attempt + 1}/3: {answer}")
@@ -425,7 +520,7 @@ async def search(request: Request):
     # 1. 先查题库文件（内存，最快）
     if not skip_cache and key in question_bank:
         answer = question_bank[key]
-        if not is_cacheable_answer(answer):
+        if not is_valid_cached_answer(answer, qtype):
             question_bank.pop(key, None)
             save_question_bank()
         else:
@@ -438,7 +533,7 @@ async def search(request: Request):
     if not skip_cache:
         cached = await db.get(key)
         if cached:
-            if not is_cacheable_answer(cached):
+            if not is_valid_cached_answer(cached, qtype):
                 await db.delete(key)
                 cached = None
         if cached:
@@ -454,7 +549,7 @@ async def search(request: Request):
     answer = await call_llm(title, options, qtype)
     elapsed = time.time() - start
 
-    if not validate_answer(answer, qtype) or not is_cacheable_answer(answer):
+    if not is_valid_cached_answer(answer, qtype):
         dashboard.record(title, "失败", elapsed, "error", 0)
         refresh_dashboard()
         return JSONResponse({"code": 0, "msg": "LLM未返回有效答案"})
@@ -496,7 +591,7 @@ async def batch_search(request: Request):
         # 先查题库
         if key in question_bank:
             answer = question_bank[key]
-            if is_cacheable_answer(answer):
+            if is_valid_cached_answer(answer, qtype):
                 stats["bank_hit"] += 1
                 dashboard.record(title, answer, 0.001, "bank")
                 return {"code": 1, "question": title, "answer": answer}
@@ -504,7 +599,7 @@ async def batch_search(request: Request):
 
         # 再查数据库
         cached = await db.get(key)
-        if cached and not is_cacheable_answer(cached):
+        if cached and not is_valid_cached_answer(cached, qtype):
             await db.delete(key)
             cached = None
         if cached and random.random() >= CACHE_RETRY_PROBABILITY:
@@ -517,7 +612,7 @@ async def batch_search(request: Request):
         start = time.time()
         answer = await call_llm(title, options, qtype)
         elapsed = time.time() - start
-        if not validate_answer(answer, qtype) or not is_cacheable_answer(answer):
+        if not is_valid_cached_answer(answer, qtype):
             dashboard.record(title, "失败", elapsed, "error", 0)
             return {"code": 0, "question": title, "msg": "LLM未返回有效答案"}
         est_tokens = len(title) * 2 + 50

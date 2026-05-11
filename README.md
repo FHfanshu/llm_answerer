@@ -58,6 +58,8 @@ REASONING_EFFORT=low
 
 纯知识题不建议开启 reasoning，通常会增加延迟和 token 消耗。
 
+当 `OPENAI_BASE_URL` 包含 `deepseek` 且 `REASONING_EFFORT` 留空时，服务会显式传入 `thinking.disabled`，避免部分 DeepSeek 推理模型返回空 `content`。
+
 ## 启动
 
 ```bash
