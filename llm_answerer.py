@@ -235,27 +235,54 @@ SYSTEM_PROMPT = """你是一个用于自学练习的题目解析助手。你需�
 """
 
 
-def build_user_message(title: str, options: str = None, qtype: str = None) -> str:
+def format_options(options: Optional[str]) -> str:
+    """Ensure options have stable A/B/C labels for LLM responses."""
+    if not options:
+        return ""
+
+    lines = [line.strip() for line in options.splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    formatted = []
+    for index, line in enumerate(lines):
+        if re.match(r"^[A-Za-z][\.、\)]\s*", line):
+            formatted.append(line)
+            continue
+        label = chr(ord("A") + index)
+        formatted.append(f"{label}. {line}")
+    return "\n".join(formatted)
+
+
+def build_user_message(title: str, options: Optional[str] = None, qtype: Optional[str] = None) -> str:
     """构建用户消息（动态部分，放最后）"""
     msg = f"题型：{qtype or 'unknown'}\n题干：{title}"
-    if options:
-        msg += f"\n选项：{options}"
+    formatted_options = format_options(options)
+    if formatted_options:
+        msg += f"\n选项：\n{formatted_options}"
     return msg
 
 
 # ========== 答案验证 ==========
-def validate_answer(answer: str, qtype: str) -> bool:
+def validate_answer(answer: str, qtype: Optional[str]) -> bool:
     if not answer or not answer.strip():
         return False
-    answer = answer.strip()
+    answer = answer.strip().upper()
     if qtype == "single":
-        return len(answer) == 1 and answer.isalpha()
+        return len(answer) == 1 and "A" <= answer <= "Z"
     elif qtype == "multiple":
-        parts = answer.split('#')
-        return all(len(p) == 1 and p.isalpha() for p in parts)
+        parts = [part.strip().upper() for part in answer.split('#')]
+        return all(len(part) == 1 and "A" <= part <= "Z" for part in parts)
     elif qtype == "judgement":
         return answer in ["正确", "错误"]
     return True
+
+
+def normalize_answer(answer: str, qtype: Optional[str]) -> str:
+    answer = answer.strip()
+    if qtype in ("single", "multiple"):
+        return answer.upper().replace(" ", "")
+    return answer
 
 
 BAD_ANSWERS = {"", "无", "none", "null", "调用失败", "api调用失败"}
@@ -288,7 +315,7 @@ async def call_llm(title: str, options: str = None, qtype: str = None) -> str:
             )
             content = resp.choices[0].message.content
             if content:
-                answer = content.strip()
+                answer = normalize_answer(content, qtype)
             if validate_answer(answer, qtype):
                 return answer
             print(f"[格式验证失败] 尝试 {attempt + 1}/3: {answer}")

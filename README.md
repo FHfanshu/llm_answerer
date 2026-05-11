@@ -280,7 +280,6 @@ user: 当前题型、题干、选项
 llm_answerer.py   主服务，OCS 接口、缓存、并发处理
 dashboard.py      Rich 终端状态面板
 search.py         Tavily/Exa 搜索封装，默认主服务不调用
-confidence.py     旧置信度增强逻辑，当前精简主服务不依赖
 .env.example      环境变量模板
 requirements.txt  Python 依赖
 ```
